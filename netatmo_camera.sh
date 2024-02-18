@@ -6,7 +6,7 @@ client_secret="Your_Client_Secret"
 refresh_token="Your_Refresh_Token"
 
 # Log file path
-log_file="logfile.log"
+log_file="/path/to/your/logfile.log"
 
 # Function to log messages with timestamp
 function log_message {
@@ -18,42 +18,69 @@ function log_message {
 function get_access_token {
     response=$(curl -s -X POST -d "grant_type=refresh_token&client_id=$client_id&client_secret=$client_secret&refresh_token=$refresh_token" "https://api.netatmo.net/oauth2/token")
     access_token=$(echo $response | jq -r '.access_token')
-    log_message "Access token obtained: $access_token"
+    if [ -z "$access_token" ]; then
+        log_message "Failed to obtain access token."
+        exit 1
+    fi
     echo $access_token
 }
 
-# Function to enable or disable monitoring of a specific camera
-function set_monitoring {
+# Function to check the current status of a specific camera
+function check_camera_status {
     local camera_name=$1
-    local mode=$2 # 'on' or 'off'
+    local expected_mode=$2
     local access_token=$(get_access_token)
-
+    
     # Get the camera data
     camera_data=$(curl -s -X GET "https://api.netatmo.net/api/gethomedata?access_token=$access_token&size=50")
-
-    # Extract the ID and VPN URL of the camera based on its name
-    camera_id=$(echo $camera_data | jq -r --arg cam_name "$camera_name" '.body.homes[0].cameras[] | select(.name == $cam_name) | .id')
-    camera_vpn_url=$(echo $camera_data | jq -r --arg cam_name "$camera_name" '.body.homes[0].cameras[] | select(.name == $cam_name) | .vpn_url')
-
-    # Build the request URL to change the monitoring status
-    if [ "$mode" == "on" ] || [ "$mode" == "off" ]; then
-        request_url="${camera_vpn_url}/command/changestatus?status=$mode"
-        # Send the request to change the monitoring status
-        response=$(curl -s -X GET "$request_url" -H "Authorization: Bearer $access_token")
-        log_message "Monitoring status change response: $response"
-
-        # Check if the response contains "status":"ok" or "error"
-        if [[ $response == *'"status":"ok"'* ]]; then
-            log_message "Monitoring status changed successfully to $mode for camera $camera_name."
-        elif [[ $response == *'"error"'* ]]; then
-            log_message "Failed to change monitoring status for camera $camera_name. Response: $response"
-        fi
+    
+    # Extract the status of the camera based on its name
+    camera_status=$(echo $camera_data | jq -r --arg cam_name "$camera_name" '.body.homes[0].cameras[] | select(.name == $cam_name) | .status')
+    
+    if [[ "$camera_status" == "$expected_mode" ]]; then
+        return 0 # Success
     else
-        log_message "Unsupported mode: $mode"
-        echo "Unsupported mode"
+        return 1 # Failure
     fi
 }
 
+# Function to enable or disable monitoring of a specific camera with retry logic
+function set_monitoring {
+    local camera_name=$1
+    local mode=$2
+    local access_token=$(get_access_token)
+    local max_retries=3
+    local retry_delay=5
+    local check_delay=10 # Delay to allow the camera to change status
+    
+    for ((retry=1; retry<=max_retries; retry++)); do
+        # Attempt to change the monitoring status
+        camera_data=$(curl -s -X GET "https://api.netatmo.net/api/gethomedata?access_token=$access_token&size=50")
+        camera_vpn_url=$(echo $camera_data | jq -r --arg cam_name "$camera_name" '.body.homes[0].cameras[] | select(.name == $cam_name) | .vpn_url')
+        if [ -z "$camera_vpn_url" ]; then
+            log_message "Camera $camera_name not found. Exiting."
+            exit 1
+        fi
+        request_url="${camera_vpn_url}/command/changestatus?status=$mode"
+        response=$(curl -s -X GET "$request_url" -H "Authorization: Bearer $access_token")
+        log_message "Attempt #$retry: Monitoring status change response: $response"
+        
+        sleep $check_delay # Wait for the camera to potentially change status
+        
+        # Check the actual status of the camera
+        if check_camera_status "$camera_name" "$mode"; then
+            log_message "Monitoring status successfully verified as $mode for camera $camera_name."
+            return 0
+        else
+            log_message "Monitoring status verification failed for camera $camera_name. Status not $mode. Retrying in $retry_delay seconds..."
+            sleep $retry_delay
+        fi
+    done
+    
+    log_message "Failed to verify monitoring status as $mode for camera $camera_name after $max_retries attempts."
+    return 1
+}
+
 # Use the function
-# set_monitoring "Name_Of_Your_Camera" "on" or "off"
+# Replace "Your_Camera" with the actual name of your Netatmo camera.
 set_monitoring "Your_Camera" "on"
